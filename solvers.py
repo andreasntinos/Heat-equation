@@ -1,12 +1,14 @@
 ## 13.06.2025
-# 
 
-# solver_function.py
+# This script is the definition of FE solvers. The heat diffusion problem is solved by using the implicit and the explicit scheme, 
+# by adding inputs the domain, the functionspace the boundary conditions, the initial condition, source term, and the directions
+# where the results are going to be saved.
 
 def heatdiff_implicit_solver(domain, Vt, bcs, material_params, time_params,
                              initial_condition, source_term,
                              output_dir, output_filename,
-                             bc_update_func=None, source_bc=None):
+                             bc_update_func=None, source_bc=None,
+                             neumann_bcs=None):
     import os
     import numpy as np
     import ufl
@@ -48,9 +50,18 @@ def heatdiff_implicit_solver(domain, Vt, bcs, material_params, time_params,
     else:
         raise TypeError("source_term must be a dolfinx Constant, Function, or callable (x, t) → array")
 
-    # Variational problem
+   # Variational problem
     a = fem.form((rho * Cp * T_trial * T_test / dt + k * dot(grad(T_trial), grad(T_test))) * ufl.dx)
-    L_form = fem.form((rho * Cp / dt * T_n + f) * T_test * ufl.dx)
+
+
+    # Base RHS form (always needed)
+    # Base RHS form
+    L_form_expr = (rho * Cp / dt * T_n + f) * T_test * ufl.dx
+
+    if neumann_bcs is not None:
+      L_form_expr += sum(g * T_test * ds_measure for g, ds_measure in neumann_bcs)
+
+    L_form = fem.form(L_form_expr)
 
     problem = LinearProblem(a, L_form, u=T_sol, bcs=bcs,
                             petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
