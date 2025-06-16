@@ -17,7 +17,7 @@ def heatdiff_implicit_solver(domain, Vt, bcs, material_params, time_params,
     from dolfinx.fem.petsc import LinearProblem
     from petsc4py import PETSc
 
-    print("Running the implicit heat diffusion solver")
+    print("✅ Running the NEW solver version!")
 
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, output_filename)
@@ -58,8 +58,21 @@ def heatdiff_implicit_solver(domain, Vt, bcs, material_params, time_params,
     # Base RHS form
     L_form_expr = (rho * Cp / dt * T_n + f) * T_test * ufl.dx
 
+    neumann_funcs = []
+
     if neumann_bcs is not None:
-      L_form_expr += sum(g * T_test * ds_measure for g, ds_measure in neumann_bcs)
+       for g, ds_measure in neumann_bcs:
+           if isinstance(g, (fem.Constant, fem.Function)):
+              L_form_expr += g * T_test * ds_measure
+              neumann_funcs.append((None, g))  # static
+           elif callable(g):
+              g_fun = fem.Function(Vt)
+              def g_expr(x, g_=g): return g_(x, 0.0).astype(PETSc.ScalarType)
+              g_fun.interpolate(g_expr)
+              L_form_expr += g_fun * T_test * ds_measure
+              neumann_funcs.append((g, g_fun))  # time-dependent
+           else:
+            raise TypeError("Neumann BC 'g' must be Constant, Function, or callable.")
 
     L_form = fem.form(L_form_expr)
 
@@ -91,6 +104,13 @@ def heatdiff_implicit_solver(domain, Vt, bcs, material_params, time_params,
             if time_dependent_source:
                 def f_expr(x): return source_term(x, current_time).astype(PETSc.ScalarType)
                 f.interpolate(f_expr)
+
+            # Update Neumann BCs
+            # Update Neumann BCs each step
+            for g_callable, g_fun in neumann_funcs:
+               if g_callable is not None:
+                def g_expr(x, g_=g_callable): return g_(x, current_time).astype(PETSc.ScalarType)
+                g_fun.interpolate(g_expr)
 
             # Time-varying boundary conditions
             if bc_update_func is not None and source_bc is not None:
