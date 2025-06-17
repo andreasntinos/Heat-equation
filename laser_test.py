@@ -47,7 +47,6 @@ if time_params["t_end"] / time_params["Nsteps"] > CFL_term:
     print(f"Warning: time step too large for stability: dt={time_params['t_end'] / time_params['Nsteps']:.4f} > CFL={CFL_term:.4f}")
     raise ValueError(f"Time step too large for stability: dt={time_params['t_end'] / time_params['Nsteps']:.4f} > CFL={CFL_term:.4f}")
   
-
 # Initial condition: zero everywhere
 def initial_condition(x): return np.full(x.shape[1], 0.0)
 
@@ -63,16 +62,35 @@ facet_tags = meshtags(domain, fdim, top_facets, values)
 # Neumann BC: constant heat flux on top
 # g = fem.Constant(domain, PETSc.ScalarType(1e5))  # W/m² # in case you want to test a cnstant heat flux
 # neumann_conditions = [(g, ds_top)]
-def gaussian_pulse(x, t, A=1e5, t0=5.0, sigma=1.0):
-    return A * np.exp(-((t - t0) ** 2) / (2 * sigma ** 2)) * np.ones(x.shape[1], dtype=PETSc.ScalarType)
+
+class MovingLaser:
+    def __init__(self, A=0.5, P=100.0, R=0.0015, v=0.01, y0=0.01):
+        self.peak = 2 * A * P / (np.pi * R**2)
+        self.R = R
+        self.v = v
+        self.y0 = y0
+        self.t = 0.0
+
+    def __call__(self, x):
+        x0 = -0.01 + self.v * self.t
+        r2 = (x[0] - x0)**2 + (x[1] - self.y0)**2
+        return self.peak * np.exp(-2 * r2 / self.R**2)
+
+laser = MovingLaser()
+scanned_distance = laser.v * time_params["t_end"]  # total distance scanned by the laser
+
+if scanned_distance > 2*length_half:
+    print(f"Warning: Scanned distance {scanned_distance:.4f} m exceeds domain size (0.02 m).")
 
 ds_top = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags, subdomain_id=1)
 
+laser = MovingLaser()
 
-def g_callable(x, t):
-    return gaussian_pulse(x, t, A=1e5, t0=5.0, sigma=1.0)
+def g_laser(x, t):
+    laser.t = t
+    return laser(x).astype(PETSc.ScalarType)
 
-neumann_conditions = [(g_callable, ds_top)]
+neumann_conditions = [(g_laser, ds_top)]
 
 # Call solver
 from solvers import heatdiff_implicit_solver
