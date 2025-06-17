@@ -85,9 +85,8 @@ delta_half_width = (13.5 * unit / 2.0) - gauge_radius
 dx_fillet = math.sqrt(delta_half_width * (2 * fillet_radius - delta_half_width))
 x_fillet_end = x_gauge_half + dx_fillet
 
-scan_v = 1.0
-t_end = (x_fillet_end - (-x_fillet_end)) / scan_v
-time_params = {"t_end": t_end, "Nsteps": 250}
+t_end = 3.0
+time_params = {"t_end": t_end, "Nsteps": 50}
 
 def initial_condition(x):
     return np.full(x.shape[1], T_room, dtype=ScalarType)
@@ -112,23 +111,44 @@ q_s = peak_flux * ufl.exp(-2 * ((x_coords[0] - x0_t)**2 + (x_coords[1] - y0_t)**
 # ===========================================
 #         CALLING THE SOLVER
 # ===========================================
-top_facet_id = 4
-ds_top = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags, subdomain_id=top_facet_id)
-neumann_bcs = [(q_s, ds_top)]
 
-output_dir = "final_working_simulation"
-output_file = "final_dogbone_scan.xdmf"
 
-# Now, we call the solver with the correct arguments
-T_final = heatdiff_implicit_solver(
+
+# Assuming the top surface has ID=4 from your meshing script.
+top_surface_id = 4
+ds = ufl.ds(domain=domain, subdomain_data=facet_tags)
+ds_top = ds(top_surface_id)
+
+
+# Create the list for the 'neumann_bcs' argument.
+
+out_file = "Heat2D_dogbone.xdmf" 
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+output_dir = "/home/ntinos/Documents/FEnics/heat equation/checkpoints" # the path where the xdmf files are saved (changes accordingly)
+
+# Define the heat flux 'g'. This could be constant or spatially varying
+g = fem.Constant(domain, PETSc.ScalarType(1000.0))  # e.g., 1000 W/m^2
+
+# Identify the top surface by facet tag ID (assuming ID 4 is the top)
+top_surface_id = 4
+ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
+ds_top = ds(top_surface_id)
+
+# Package the Neumann condition as a list of (flux, measure) tuples
+neumann_conditions = [(g, ds_top)]
+
+# Call the solver
+time_series, center_temp, T_final = heatdiff_implicit_solver(
     domain=domain,
     Vt=Vt,
     bcs=bcs,
     material_params=material_params,
     time_params=time_params,
     initial_condition=initial_condition,
-    neumann_terms=neumann_bcs,
-    time_const=time_c,
+    source_term=fem.Constant(domain, PETSc.ScalarType(0.0)),  # No body source
     output_dir=output_dir,
-    output_filename=output_file 
+    output_filename=out_file,
+    neumann_bcs=None  
 )
