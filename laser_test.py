@@ -129,15 +129,44 @@ time_series, center_temp, T_final = heatdiff_implicit_solver(
 #              VALIDATION WITH GREEN'S FUNCTION
 # ===================================================
 
+import numpy as np
 import matplotlib.pyplot as plt
 
+# --- Material and process parameters ---
+T0 = 293             # Initial bed temperature in Kelvin
+rho = 7850           # Density (kg/m^3)
+Cp = 500             # Specific heat capacity (J/kg·K)
+A = 0.15             # Absorptivity (dimensionless)
+P = 70               # Laser beam power in Watts
+k = 15               # Thermal conductivity in W/m·K
+alpha = k / (rho * Cp)  # Thermal diffusivity in m^2/s
+V = 0.1              # Scanning speed in m/s
+x0, y0 = 0.004, 0.0  # Observation point (meters)
+R = 130e-6           # Laser beam radius in meters
 
-plt.figure(figsize=(10, 6))
-plt.plot(time_series, center_temp, label="FEniCS solution for the top center point")
-plt.xlabel("Time (s)")
-plt.ylabel("Temperature (K)")
-plt.title("Temperature at the center of the top boundary over time")
-plt.grid()
+# --- Time array (simulate heat source passing observation point) ---
+t = np.linspace(0.0, 0.08, 1000)  # Adjust N here (e.g., 60, 100, 1000)
+
+# --- Rosenthal solution with physical laser spot size ---
+def rosenthal_temp_physical(t):
+    xi = x0 - V * t
+    y_prime = y0
+    r_squared = xi**2 + y_prime**2 + 0.112*R**2  # Add physical radius to avoid singularity
+    r = np.sqrt(r_squared)
+
+    return T0 + (A * P / (2 * np.pi * k * r)) * np.exp(-V * (r + xi) / (2 * alpha))
+
+# --- Calculate temperature profile ---
+T_analytical = rosenthal_temp_physical(t)
+
+# --- Plot the temperature profile ---
+plt.figure(figsize=(8, 5))
+plt.plot(t, T_analytical, label='Rosenthal Temp with Spot Size', color='darkred')
+plt.plot(time_series, center_temp, label='FEniCS result')
+plt.xlabel('Time (s)')
+plt.ylabel('Temperature (K)')
+plt.title('Rosenthal Temperature at Fixed Point vs. Time')
+plt.grid(True)
 plt.legend()
-plt.savefig(os.path.join(script_dir, "temperature_center_top_boundary.png"))
-plt.show()  
+plt.tight_layout()
+plt.show()
