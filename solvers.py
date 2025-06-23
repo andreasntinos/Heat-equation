@@ -139,7 +139,6 @@ def heatdiff_implicit_solver(domain, Vt, bcs, material_params, time_params,
     print(f"Simulation finished. Recorded {len(top_temperatures)} steps.")
     return time_series, top_temperatures, T_sol
 
-
 def heatdiff_explicit_solver(domain, Vt, bcs, material_params, time_params,
                              initial_condition, source_term,
                              output_dir, output_filename,
@@ -259,3 +258,122 @@ def heatdiff_explicit_solver(domain, Vt, bcs, material_params, time_params,
 
     print(f"\n✅ Explicit simulation complete. {len(top_temp)} steps recorded.")
     return time_series, top_temp, T_n
+
+def heatdiff_theta_solver(domain, Vt, bcs, material_params, time_params,
+                          initial_condition, source_term,
+                          output_dir, output_filename,
+                          theta=1.0,
+                          bc_update_func=None, source_bc=None,
+                          neumann_bcs=None):
+ 
+    assert 0.0 <= theta <= 1.0, f"θ must be between 0 and 1. Got {theta}"
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, output_filename)
+
+    rho, Cp, k = material_params["rho"], material_params["Cp"], material_params["k_therm"]
+    t_end, Nsteps = time_params["t_end"], time_params["Nsteps"]
+    dt = t_end / Nsteps
+    mesh_comm = domain.comm
+
+    T_n = fem.Function(Vt)
+    T_n.name = "Temperature"
+    T_n.interpolate(initial_condition)
+
+    T_sol = fem.Function(Vt, name="Temperature")
+    T_test = TestFunction(Vt)
+    T_trial = TrialFunction(Vt)
+
+    # Setup source
+    if isinstance(source_term, (fem.Constant, fem.Function)):
+        f = source_term
+        time_dependent = False
+    elif callable(source_term):
+        f = fem.Function(Vt)
+        f.interpolate(lambda x: source_term(x, 0.0).astype(PETSc.ScalarType))
+        time_dependent = True
+    else:
+        raise TypeError("source_term must be Constant, Function, or callable")
+
+    # Neumann BCs
+    L_neumann = 0
+    neumann_funcs = []
+    if neumann_bcs:
+        for g, ds in neumann_bcs:
+            if isinstance(g, (fem.Constant, fem.Function)):
+                L_neumann += g * T_test * ds
+                neumann_funcs.append((None, g))
+            elif callable(g):
+                g_fun = fem.Function(Vt)
+                g_fun.interpolate(lambda x: g(x, 0.0).astype(PETSc.ScalarType))
+                L_neumann += g_fun * T_test * ds
+                neumann_funcs.append((g, g_fun))
+            else:
+                raise TypeError("Invalid Neumann BC")
+
+    with io.XDMFFile(mesh_comm, output_path, "w") as xdmf:
+        xdmf.write_mesh(domain)
+        xdmf.write_function(T_n, 0.0)
+
+    # Probe center
+    def probe(x, tol=1e-8):
+        return np.logical_and(np.abs(x[0]) < tol, np.abs(x[1]) < tol)
+    top_dof = fem.locate_dofs_geometrical(Vt, probe)
+    top_temp, time_series = [], []
+
+    # Precompute mass lumping if needed
+    if theta == 0.0:
+        one = fem.Function(Vt)
+        one.interpolate(lambda x: np.ones_like(x[0]))
+        mass_form_lump = fem.form(rho * Cp * one * T_test * dx)
+        M_lump_vec = assemble_vector(mass_form_lump)
+        M_lump_vec.assemble()
+        M_lumped_inv_array = 1.0 / M_lump_vec.array
+
+    for n in range(Nsteps):
+        t = (n + 1) * dt
+
+        if time_dependent:
+            f.interpolate(lambda x: source_term(x, t).astype(PETSc.ScalarType))
+        for g_func, g_fun in neumann_funcs:
+            if g_func:
+                g_fun.interpolate(lambda x, g_=g_func: g_(x, t).astype(PETSc.ScalarType))
+
+        if bc_update_func and source_bc:
+            source_bc.t = t
+            bc_update_func.interpolate(lambda x: source_bc(x))
+
+        if theta == 1.0:
+            a = (rho * Cp * T_trial * T_test / dt + k * dot(grad(T_trial), grad(T_test))) * ufl.dx
+            L = (rho * Cp * T_n / dt + f) * T_test * ufl.dx + L_neumann
+            problem = LinearProblem(a, L, u=T_sol, bcs=bcs,
+                                    petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
+            problem.solve()
+            T_n.x.array[:] = T_sol.x.array
+        else:
+            rhs = fem.form((-k * dot(grad(T_n), grad(T_test)) + f * T_test) * ufl.dx + L_neumann)
+            b = assemble_vector(rhs)
+            b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
+            set_bc(b, bcs)
+
+            start, end = Vt.dofmap.index_map.local_range
+            owned = np.arange(start, end, dtype=np.int32)
+
+            T_n.x.array[owned] += dt * b.array[owned] * M_lumped_inv_array
+            T_n.x.scatter_forward()
+            for bc in bcs:
+                bc.set(T_n.x.array, None)
+            T_sol.x.array[:] = T_n.x.array
+
+        if len(top_dof) > 0:
+            top_val = T_sol.x.array[top_dof[0]]
+            top_temp.append(top_val)
+            time_series.append(t)
+            print(f"Step {n+1:04d} | t = {t:.3f} | T_top = {top_val:.6f}")
+        else:
+            print(f"Step {n+1:04d} | t = {t:.3f} | No top DOF found.")
+
+        with io.XDMFFile(mesh_comm, output_path, "a") as xdmf:
+            xdmf.write_function(T_sol, t)
+
+    print(f"\n✅ θ-solver complete. {len(top_temp)} steps recorded.")
+    return time_series, top_temp, T_sol
