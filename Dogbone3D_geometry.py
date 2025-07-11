@@ -1,169 +1,241 @@
-# 22.06.2025
+# # 22.06.2025 
+# This code creates the specimen geometry for the Heat conduction problem and creates 
+# an XDMF file with the mesh that is called in the code of Heat3D_dogbone.py 
 
 #=================================
 #           LIBRARIES            #
 #=================================
 
-from mpi4py import MPI # MPI library is to carry out parallel computations
-import gmsh # interface to the gmsh geometry 
-import math # math.calculations, will be used for the fillet of the geometry
-from dolfinx import fem, mesh, io # io is for writing XMDF files(providing input and ouptut)
-from dolfinx.io.gmshio import model_to_mesh # we need this command in order to convert the gmsh model to a Dolfinx mesh
-import numpy as np
-import os 
+from mpi4py import MPI  # MPI library is to carry out parallel computations
+import gmsh  # interface to the gmsh geometry
+import math  # math.calculations, will be used for the fillet of the geometry
+from dolfinx import fem, mesh, io  # io is for writing XMDF files(providing input and ouptut)
+from dolfinx.io.gmshio import model_to_mesh  # we need this command in order to convert the gmsh model to a Dolfinx mesh
+import numpy as np  # Import numpy for numerical operations
+import os  # Import os for interacting with the operating system (e.g., creating directories)
 
-gmsh.initialize()
+# MPI setup
+mesh_comm = MPI.COMM_WORLD  # Get the global MPI communicator
+model_rank = 0 # the mesh creation is the main process and gathers all the cores
+gdim = 3 # dimension of the problem
+fdim = gdim - 1 # dimension of the facets where the boundary conditions will be applied
 
-# All geometric parameters
-unit = 0.001
-gauge_length = 8 * unit
-gauge_diameter = 5 * unit
-end_diameter = 13.5 * unit
-fillet_radius = 13.5 * unit
-end_length_straight = 16 * unit
-
-# Mesh size parameters
-h_mesh = 0.8 * unit  # FE mesh size
-# At the region of the top surface where the laser will be applied, we want the mesh to be as dense as possible
-h_fine = 0.02 * unit # Element size for the refined top gauge and fillets 
-
-
-gdim = 3 # the geometric dimension of the body
-fdim = gdim - 1 # geometric dimension of the facets 
-occ = gmsh.model.occ # open CASCAD engine for the geometry definition- a toolbox in gmsh that enables you to manipulate complex geometries
-mesh_comm = MPI.COMM_WORLD # parallel computing communicator
-model_rank = 0 # the first process of the code which will be the meshing of the geometry 
-
-# The geometry and mesh will only be created on a single processor
+# Only the model_rank (root) process creates the Gmsh geometry
 if mesh_comm.rank == model_rank:
-    gmsh.model.add("dogbone_3d_refined")
-    gmsh.model.setCurrent("dogbone_3d_refined")
-    occ = gmsh.model.occ
+    gmsh.model.add("dogbone_mesh") # Add a new Gmsh model with a given name
+    gmsh.model.setCurrent("dogbone_mesh")
+    occ = gmsh.model.occ           # Get the OpenCASCADE CAD kernel interface
 
-    # geometry definition (2D)
+    gmsh.initialize()
+
+    # ============================
+    #         Parameters
+    # ============================
+    unit = 0.001 # all the dimensions are in meters
+    gauge_length = 8 * unit
+    gauge_diameter = 5 * unit
+    end_diameter = 13.5 * unit
+    fillet_radius = 13.5 * unit
+    end_length_straight = 16 * unit
+
+    h_mesh = 1.0 * unit
+    h_fine = 0.02 * unit
+
     gaude_radius = gauge_diameter / 2.0
     end_radius = end_diameter / 2.0
     delta_half_width = end_radius - gaude_radius
-    dx_fillet = math.sqrt(delta_half_width * (2 * fillet_radius - delta_half_width))
+    dx_fillet = math.sqrt(max(0, delta_half_width * (2 * fillet_radius - delta_half_width)))
+    assert dx_fillet > 0
+
     x_gauge_half = gauge_length / 2.0
     x_fillet_end = x_gauge_half + dx_fillet
     x_outer_end = x_fillet_end + end_length_straight
 
-    # The difference with the 2D case is that now we do not neeed to add 1 point but only 8: create the upper part of the specimen geometry
-    # and then revolve it to produce the 3D cylindrical geometry
-    gpts = [
-        occ.add_point(x_outer_end, 0, 0), occ.add_point(x_outer_end, end_radius, 0),
-        occ.add_point(x_fillet_end, end_radius, 0), occ.add_point(x_gauge_half, gaude_radius, 0),
-        occ.add_point(-x_gauge_half, gaude_radius, 0), occ.add_point(-x_fillet_end, end_radius, 0),
-        occ.add_point(-x_outer_end, end_radius, 0), occ.add_point(-x_outer_end, 0, 0)
+    # ============================
+    #          Geometry
+    # ============================
+
+    # the following are the ponins that defines the outline of the geometry
+    p = [
+        occ.add_point(x_outer_end, 0, 0),
+        occ.add_point(x_outer_end, end_radius, 0),
+        occ.add_point(x_fillet_end, end_radius, 0),
+        occ.add_point(x_gauge_half, gaude_radius, 0),
+        occ.add_point(-x_gauge_half, gaude_radius, 0),
+        occ.add_point(-x_fillet_end, end_radius, 0),
+        occ.add_point(-x_outer_end, end_radius, 0),
+        occ.add_point(-x_outer_end, 0, 0)
     ]
-    gcenters = [occ.add_point(x_gauge_half, gaude_radius + fillet_radius, 0), occ.add_point(-x_gauge_half, gaude_radius + fillet_radius, 0)]
-    
+
+    # c stands for the centers for all the fillets
+    c = [
+        occ.add_point(x_gauge_half, gaude_radius + fillet_radius, 0),
+        occ.add_point(-x_gauge_half, gaude_radius + fillet_radius, 0)
+    ]
+    # Define line segments and circular arcs that form the 2D profile
     lines = {
-        "right_face": occ.add_line(gpts[0], gpts[1]), "top_straight_right_end": occ.add_line(gpts[1], gpts[2]),
-        "fillet_tr": occ.add_circle_arc(gpts[2], gcenters[0], gpts[3]), "top_gauge": occ.add_line(gpts[3], gpts[4]),
-        "fillet_tl": occ.add_circle_arc(gpts[4], gcenters[1], gpts[5]), "top_straight_left_end": occ.add_line(gpts[5], gpts[6]),
-        "left_face": occ.add_line(gpts[6], gpts[7]), "bottom_closure": occ.add_line(gpts[7], gpts[0])
+        "right_face": occ.add_line(p[0], p[1]),
+        "top_straight_right_end": occ.add_line(p[1], p[2]),
+        "fillet_tr": occ.add_circle_arc(p[2], c[0], p[3]),
+        "top_gauge": occ.add_line(p[3], p[4]),
+        "fillet_tl": occ.add_circle_arc(p[4], c[1], p[5]),
+        "top_straight_left_end": occ.add_line(p[5], p[6]),
+        "left_face": occ.add_line(p[6], p[7]),
+        "bottom_closure": occ.add_line(p[7], p[0])
     }
-    curve_loop_segments = [lines[i] for i in ["right_face", "top_straight_right_end", "fillet_tr", "top_gauge", "fillet_tl", "top_straight_left_end", "left_face", "bottom_closure"]]
-    curve_loop = occ.add_curve_loop(curve_loop_segments)
+    # # Create a closed loop from the defined line segments (edges of the 2D profile)
+    # This loop outlines the cross-sectional shape of the dogbone specimen
+    curve_loop = occ.add_curve_loop([lines[k] for k in lines])
+    
+    # Create a planar surface bounded by the curve loop
+    # This surface represents the 2D profile that will be revolved into a 3D volume
     surface = occ.add_plane_surface([curve_loop])
+    # Synchronize the OpenCASCADE kernel with the Gmsh model
+    # This is required before performing further operations like revolve or meshing
     occ.synchronize()
 
-    # Mesh refinement: this is an easier way to apply the refinement to the mesh by applying a constant mesh around the top lines, which becomes
-    # less dense as you get far from the top surface, (the difference with the previous method is that now cant achieve a smooth transition 
-    # between the mesh_size and the fine_mesh size)
-    
-    #refined_lines = [lines["fillet_tr"], lines["top_gauge"], lines["fillet_tl"]] #in case you want to refine the whole upper laser path
-    refined_lines = [lines["fillet_tr"], lines["top_gauge"], lines["fillet_tl"]]
-    gmsh.model.mesh.field.add("Constant", 1)
-    gmsh.model.mesh.field.setNumber(1, "VIn", h_fine)
-    gmsh.model.mesh.field.setNumbers(1, "CurvesList", refined_lines)
-    gmsh.model.mesh.field.add("Min", 2)
-    gmsh.model.mesh.field.setNumbers(2, "FieldsList", [1])
+    # ============================
+    # Revolve
+    # ============================
+    # Revolve the 2D surface around the x-axis (0,0,0 as point, 1,0,0 as axis) by 2*pi (360 degrees)
+    revolved = occ.revolve([(2, surface)], 0, 0, 0, 1, 0, 0, 2 * math.pi)
+    occ.synchronize()
+
+    # Get the tag of the newly created 3D volume
+
+    volume_tag = next((e[1] for e in revolved if e[0] == 3), None)
+    assert volume_tag
+
+    # ============================
+    # Box refinement
+    # ============================
+    # Define the lines you want to refine around: same as in your first code
+    # --- Radial refinement ---
+    # ===============================
+    # 1. Pick the gauge lines for refinement
+    refined_lines = [lines["top_gauge"]]
+
+    # ===============================
+    # 2. Create a band surface by extruding the gauge line to give it axial thickness
+    # We'll extrude the top gauge line symmetrically ± along Z to make a thin surface band.
+
+    band_half_length = 0.5 * unit  # 0.5 mm up, 0.5 mm down → 1 mm band
+    extrusions = []
+
+    for l in refined_lines:
+        # Extrude up
+        up = occ.extrude([(1, l)], 0, 0, band_half_length)
+        extrusions.extend(up)
+        # Extrude down
+        down = occ.extrude([(1, l)], 0, 0, -band_half_length)
+        extrusions.extend(down)
+
+    occ.synchronize()
+
+    # Collect new surface tags
+    band_surfaces = [e[1] for e in extrusions if e[0] == 2]
+
+    # ===============================
+    # 3. Distance field to the band surfaces
+    gmsh.model.mesh.field.add("Distance", 1)
+    gmsh.model.mesh.field.setNumbers(1, "SurfacesList", band_surfaces)
+    gmsh.model.mesh.field.setNumber(1, "NumPointsPerCurve", 100)
+
+    # ===============================
+    # 4. Threshold for smooth gradation
+    gmsh.model.mesh.field.add("Threshold", 2)
+    gmsh.model.mesh.field.setNumber(2, "InField", 1)
+    gmsh.model.mesh.field.setNumber(2, "SizeMin", h_fine)
+    gmsh.model.mesh.field.setNumber(2, "SizeMax", h_mesh)
+    gmsh.model.mesh.field.setNumber(2, "DistMin", 0.0)
+    gmsh.model.mesh.field.setNumber(2, "DistMax", 1.0 * unit)  # Smooth transition over 1 mm radially
+
+    # ===============================
+    # 5. Set this as the background mesh
     gmsh.model.mesh.field.setAsBackgroundMesh(2)
+
+    # ===============================
+    # 6. Still enforce global max mesh size as a fallback
     gmsh.option.setNumber("Mesh.MeshSizeMax", h_mesh)
 
-    # Revolve geometry 
-    revolved_entities = occ.revolve([(2, surface)], 0, 0, 0, 1, 0, 0, 2 * math.pi) # this line says to find the 2D shape that has the ID
-                                                                                   # surface and then revolve it around for 2*pi
-    occ.synchronize()
+    # ============================
+    # Physical groups
+    # ============================
+    gmsh.model.add_physical_group(3, [volume_tag], tag=1)
+    gmsh.model.set_physical_name(3, 1, "DogboneVolume")
 
-    volume_tag = next((entity[1] for entity in revolved_entities if entity[0] == 3), None) 
-
-    # Tag the volume 
-    gmsh.model.add_physical_group(3, [volume_tag], tag=1) # 3 is the dimension, volume_tag is the variable that holds the ID and then
-                                                          # tag=1 is the specific ID for the whole cylindrical volume
-    gmsh.model.set_physical_name(3, 1, "DogboneVolume") 
-
-    # Get all boundary surfaces of the volume: the following line searches for the boundaries of the entity with dimension 3 and the tag stored
-    # in the volume_tag variable
-    boundary_surfaces = gmsh.model.get_boundary([(3, volume_tag)], oriented=False, combined=False) 
-
-    # Detect and tag left and right flat end surfaces
+    bnds = gmsh.model.get_boundary([(3, volume_tag)], oriented=False, combined=False)
     tol = 1e-6
-    left_face_entities, right_face_entities, laser_face_entities, top_surface_tags = [], [], [], []
+    left_face, right_face, laser_face, top_surf = [], [], [], []
 
-    # The following loop is what defines the left and right boundaries. We have defined boundary_surfaces that returned all the 2D boundaries of the volume
-    # Then we scan this result checking all the dimensions and the tags with the "gmsh.model.occ.get_center_of_mass" that returns the center of mass
-    # of each geometry. IF the center of mass is equal to the point in the end of the -length by a tolerance of tol, then this 2D geometry
-    # is the left surface, ELSE it is the right side. IF the center of mass in the x direction is smaller than the half of gauge length
-    # then it is the top surface of the specimen 
-
-    for dim, tag in boundary_surfaces:
+    for dim, tag in bnds:
         com = gmsh.model.occ.get_center_of_mass(dim, tag)
         if math.isclose(com[0], -x_outer_end, abs_tol=tol):
-            left_face_entities.append(tag)
+            left_face.append(tag)
         elif math.isclose(com[0], x_outer_end, abs_tol=tol):
-            right_face_entities.append(tag)
+            right_face.append(tag)
         elif abs(com[0]) < x_fillet_end:
-            # This correctly identifies only the top surfaces (gauge + fillets) for losses
-            top_surface_tags.append(tag)
+            top_surf.append(tag)
         else:
-            laser_face_entities.append(tag)
+            laser_face.append(tag)
 
-    gmsh.model.add_physical_group(2, left_face_entities, tag=2)
+    gmsh.model.add_physical_group(2, left_face, tag=2)
     gmsh.model.set_physical_name(2, 2, "LeftEnd")
-
-    gmsh.model.add_physical_group(2, right_face_entities, tag=3)
+    gmsh.model.add_physical_group(2, right_face, tag=3)
     gmsh.model.set_physical_name(2, 3, "RightEnd")
-
-    gmsh.model.add_physical_group(2, laser_face_entities, tag=4)
+    gmsh.model.add_physical_group(2, laser_face, tag=4)
     gmsh.model.set_physical_name(2, 4, "LaserSurface")
-
-    gmsh.model.add_physical_group(2, top_surface_tags, tag=5)
+    gmsh.model.add_physical_group(2, top_surf, tag=5)
     gmsh.model.set_physical_name(2, 5, "TopSurface")
 
     occ.synchronize()
 
     print("\n=== Physical Groups ===")
-   
-    for dim in [2, 3]:
-        groups = gmsh.model.getPhysicalGroups(dim)
-        for (d, tag) in groups:
-           name = gmsh.model.getPhysicalName(d, tag)
-           entities = gmsh.model.getEntitiesForPhysicalGroup(d, tag)
-           print(f"{name} (dim={d}, tag={tag}) has entities: {entities}")
-    
-    gmsh.model.mesh.generate(gdim) # generate mesh 
-    # 5. CONVERT MESH TO DOLFINX AND FINALIZE GMSH
-    domain, cell_markers, facet_markers = model_to_mesh(gmsh.model, mesh_comm, model_rank, gdim=gdim)
-gmsh.finalize()
+    for d, tag in gmsh.model.getPhysicalGroups(3) + gmsh.model.getPhysicalGroups(2):
+        print("Dim", d, "Tag", tag)
 
-# Naming
+    gmsh.option.setNumber("Mesh.Algorithm3D", 4)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+    gmsh.model.mesh.generate(gdim)
+
+    domain, cell_markers, facet_markers = model_to_mesh(
+        gmsh.model, mesh_comm, model_rank, gdim=gdim
+    )
+    gmsh.finalize()
+
+else:
+    domain, cell_markers, facet_markers = model_to_mesh(None, mesh_comm, model_rank, gdim=gdim)
+
+# Give all objects explicit names
 domain.name = "dogbone_mesh"
 cell_markers.name = "cell_tags"
 facet_markers.name = "facet_tags"
-print("Facet markers:", np.unique(facet_markers.values))
 
-# Save path
+# Define output path and save file
 output_dir = "/home/ntinos/Documents/FEnics/heat equation/checkpoints"
 os.makedirs(output_dir, exist_ok=True)
 out_file = os.path.join(output_dir, "Dogbone3D.xdmf")
 
-# Export to XDMF
+# Save mesh + tags
 with io.XDMFFile(domain.comm, out_file, "w") as xdmf:
-    xdmf.write_mesh(domain)
+    xdmf.write_mesh(domain)  # no name argument, uses domain.name
     domain.topology.create_connectivity(fdim, gdim)
-    xdmf.write_meshtags(facet_markers, domain.geometry)
+    xdmf.write_meshtags(cell_markers, domain.geometry)  # uses .name internally
+    xdmf.write_meshtags(facet_markers, domain.geometry)  # uses .name internally
 
+print("Mesh saved to:", out_file)
+
+# ============================
+# Visualize mesh with PyVista
+from dolfinx.io import VTKFile
+vtk = VTKFile(domain.comm, "dogbone_mesh.pvd", "w")
+vtk.write_mesh(domain)
+vtk.close()
+
+import pyvista as pv
+
+mesh = pv.read("dogbone_mesh.pvd")
+
+plotter = pv.Plotter()
+plotter.add_mesh(mesh, show_edges=True)
+plotter.show(screenshot="dogbone_mesh.png")  #  Shows the window and saves the image
