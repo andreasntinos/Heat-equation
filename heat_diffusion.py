@@ -4,7 +4,7 @@
 # This is the first and simpliest case of Heat Conduction, where the diffusion equation is being solved in a 2D rectangle with 
 # i. zero temperature boundary conditions are applied in the left and right facet and a gaussian initial condition applied on the domain
 # The solver for the heat conduction problem is built without taking into consideration Neumann boundary conditions or external heat source. 
-# Under these conditions, the problem is linear and  is solved using the LinearSolver of dolfinx. The results are validated though the corresponding code of Doken 
+# Under these conditions, the problem is linear and  is solved using the LinearSolver of dolfinx. The results are validated though the following code of Doken 
 # "https://jsdokken.com/dolfinx-tutorial/chapter2/diffusion_code.html"
 
 #===================================================
@@ -17,17 +17,13 @@ from mpi4py import MPI  # library for paraller computing, allow processes to com
 
 from dolfinx import mesh, fem, io #dolfinx is the library that i) will produce the mesh of our geometry, and 
                                                              # ii) will provide the solver for the linear problem 
-
-from dolfinx.fem.petsc import LinearProblem # LinearProblem is a class in dolfinx that provides a convenient way to solve linear problems using PETSc
-from dolfinx.fem import Function, Constant # Function is a class that represents a function in the function space,
-from petsc4py import PETSc # PETSc is a library for solving linear and nonlinear equations, and it is used by dolfinx for efficient numerical computations
+from dolfinx.fem.petsc import LinearProblem 
+from petsc4py import PETSc
 from ufl import TestFunction, TrialFunction, Measure, dot, grad, sin
 from petsc4py.PETSc import ScalarType
 
-from dolfinx.fem.petsc import assemble_vector, assemble_matrix, create_vector, apply_lifting, set_bc # assemble_vector and assemble_matrix are functions that compute the vector and matrix representations of the variational problem,
 import matplotlib.pyplot as plt # library for the post porcessing and plotting of the temperature profiles
 import os # python module to interact with the operating system
-from solvers import heatdiff_implicit_solver, heatdiff_explicit_solver # check solvers.py where these two are defined.
 
 #===================================================
 #                 GEOMETRY AND MESH
@@ -39,13 +35,14 @@ Nx, Ny = 50, 50            # the number of finite elements used in this problem
 
 domain = mesh.create_rectangle(mesh_comm, [np.array([-2.0, -2.0]), np.array([2.0, 2.0])],
                                [Nx, Ny],
-                               mesh.CellType.triangle)
+                               mesh.CellType.triangle) # simple rectngular geometry
 
-Vt = fem.functionspace(domain, ("Lagrange", 1)) # a scalar type function space where Lagrange FE are defined, 
-                                                # with polynomial shape function of 1st order
+Vt = fem.functionspace(domain, ("Lagrange", 1)) # the function space where Lagrange FE are defined, 
+                                                # with polynomial shape function- interpolation 1st order
+                                                
 
-out_file = "heat_diffusion_imlpicit.xdmf" # we create an xdmf file where the mesh of the geometry will be saved 
-                                 # later, in the time scheme, the implicit solution of T at each time step will be saved in this xdmf file 
+out_file1 = "heat_diffusion_imlpicit.xdmf" # we create an xdmf file where the mesh of the geometry will be saved 
+                                           # later, in the time scheme, the solution of T at each time step will be saved in this xdmf file 
 
 out_file2 = "heat_diffusion_explicit.xdmf" 
 
@@ -54,13 +51,13 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 output_dir = "/home/ntinos/Documents/FEnics/heat equation/checkpoints" # the path where the xdmf files are saved (changes accordingly)
 os.makedirs(output_dir, exist_ok=True)
 
+out_file = os.path.join(output_dir, "heat_diffusion.xdmf")
 
 with io.XDMFFile(domain.comm, out_file, "w") as xdmf:
     xdmf.write_mesh(domain)
 
 ## INITIAL CONDITION 
 # use the exponential function of the Gaussian distribution
-
 def initial_condition(x, a=5):
     return np.exp(-a * (x[0]**2 + x[1]**2))
 
@@ -68,7 +65,6 @@ def initial_condition(x, a=5):
 # detect the boundary facets of the geometry
 def top(x):
     return np.isclose(x[1], 2.0) # np.isclose(a,b) is a command in numpy that returns true when a and b are equal
-# This is used to detect the boundary facets of the geometry, i.e. the top, bottom, left and right facets of the rectangle
 
 def bottom(x):
     return np.isclose(x[1], -2.0)
@@ -80,70 +76,100 @@ def left(x):
     return np.isclose(x[0], -2.0)
 
 # now detect the dofs of the nodes that touch the boundaries we set above
-top_dofs = fem.locate_dofs_geometrical(Vt, top) # locate the dofs of the top boundary facet
+top_dofs = fem.locate_dofs_geometrical(Vt, top)
 bottom_dofs = fem.locate_dofs_geometrical(Vt, bottom) # Not used in current BCs, but good to have
 right_dofs = fem.locate_dofs_geometrical(Vt, right)
 left_dofs = fem.locate_dofs_geometrical(Vt, left)
 
-bcs = [fem.dirichletbc(ScalarType(0.0), left_dofs, Vt), # Dirichlet boundary conditions are applied to the left, right, top and bottom facets of the rectangle
+bcs = [fem.dirichletbc(ScalarType(0.0), left_dofs, Vt),
        fem.dirichletbc(ScalarType(0.0), right_dofs, Vt),
        fem.dirichletbc(ScalarType(0.0), top_dofs, Vt),
        fem.dirichletbc(ScalarType(0.0), bottom_dofs, Vt)
        ]
 
 # Material parameters: for the case of validation we set these quantities equal to zero 
-material_params = {"rho": 1.0, "Cp": 1.0, "k_therm": 1.0} # rho is the density, Cp is the specific heat capacity, k_therm is the thermal conductivity
-time_params = {"t_end": 1.0, "Nsteps": 2000}
+material_params = {"rho": 1.0, 
+                   "Cp": 1.0, 
+                   "k_therm": 1.0}
+
+time_params = {"t_end": 1.0, 
+               "Nsteps": 5000}
+
+# Initial condition
+T_n = fem.Function(Vt)
+T_n.name = "Temperature"
+T_n.interpolate(initial_condition) # set the initial condition to follow the Gaussian distribution
+
+f_const = fem.Constant(domain, PETSc.ScalarType(0.0))
+
+source_term = f_const
 
 #===================================================
 #               VARIATIONAL FORMULATION
 #===================================================
 
-# Initial condition
-T_n = fem.Function(Vt) # T_n is the function that will hold the temperature at the previous time step
-T_n.name = "Temperature" 
-T_n.interpolate(initial_condition) # set the initial condition to follow the Gaussian distribution
+from solvers import heatdiff_implicit_solver, heatdiff_explicit_solver, heatdiff_theta_solver
 
-f_const = fem.Constant(domain, PETSc.ScalarType(0.0)) # f_const is a constant function that will be used as the source term in the variational formulation
+# Call Implicit Solver
+#print("\n--- Running Implicit Solver ---")
+#time_imp, temp_imp, _ = heatdiff_implicit_solver(
+#  domain, Vt, bcs,
+#  material_params,
+#  time_params,
+#  initial_condition,
+#  source_term,
+#  output_dir,
+#  out_file1 # Use appropriate filename for implicit results
+#)
 
-source_term = f_const
+# You might want to save implicit results too if needed
+#np.savetxt("heat_diffusion_implicit.txt", np.column_stack((time_imp, temp_imp)))
 
-time, temp1, _ = heatdiff_implicit_solver( 
-   domain, Vt, bcs,
+#print("\n--- Running Explicit Solver ---")
+time_exp, temp_exp, _ = heatdiff_implicit_solver(
+    domain, Vt, bcs,
     material_params,
-   time_params,
-    initial_condition,
-    source_term,
-    output_dir,
-    out_file
-)
-
-#np.savetxt("heat_diffusion.txt", np.column_stack((time, temp1)))
-
-
-time2, temp2, _ = heatdiff_explicit_solver(
-    domain, Vt, bcs, 
-    material_params, 
     time_params,
     initial_condition,
     source_term,
     output_dir,
-    out_file2
+    out_file2  # Use appropriate filename for explicit results
 )
 
-import matplotlib.pyplot as plt
+# You might want to save explicit results too if needed
+#np.savetxt("heat_diffusion_explicit.txt", np.column_stack((time_exp, temp_exp)))
+
+# Choose the theta value you want:
+theta = 0.0   # Explicit(Forward Euler)
+# theta = 1.0 # Implicit (Backward Euler)
+# theta = 0.5 # Crank-Nicolson
+
+#print(f"\n--- Running θ-Method Solver (θ = {theta}) ---")
+time_theta, temp_theta, final_solution = heatdiff_theta_solver(
+    domain=domain,
+    Vt=Vt,
+    bcs=bcs,
+    material_params=material_params,
+    time_params=time_params,
+   initial_condition=initial_condition,
+    source_term=source_term,
+    output_dir=output_dir,
+   output_filename=f"heat_theta_{theta:.1f}.xdmf",
+   theta=theta,
+   bc_update_func=None,       # or your time-varying BC object
+   source_bc=None,            # or your source BC with `.t` attribute
+    neumann_bcs=None           # or your list of (g, ds) pairs
+)
 
 plt.figure(figsize=(8, 5))
-plt.plot(time, temp1, label="Implicit", marker='o', linewidth=2)
-plt.plot(time2, temp2, label="Explicit", marker='x', linestyle='--', linewidth=2)
+#plt.plot(time_imp, temp_imp, label="Implicit", marker='o', linewidth=2) # If you have separate implicit results
+plt.plot(time_exp, temp_exp, label="Explicit (Dedicated Solver)", linewidth=2.0, color='black') # Added color and explicit label
+plt.plot(time_theta, temp_theta, label=f"Theta Solver (θ={theta})", linestyle='--', color='red')
+
 plt.xlabel("Time [s]")
 plt.ylabel("Temperature at center")
-plt.title("Heat Diffusion: Implicit vs Explicit")
+plt.title(f"Heat Diffusion: Explicit vs Theta Method (θ={theta})") # Updated title
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
-
-
-diff = np.abs(np.array(temp2) - np.array(temp1))
-print(f"Max difference at center: {np.max(diff):.2e}")
