@@ -1,5 +1,9 @@
 # 23.07.2024 - 3D transient heat solver with moving laser + Neumann BC (explicit)
 
+
+# 23.07.2024 - 3D transient heat solver with moving laser + Neumann BC (explicit)
+# 23.07.2024 - 3D transient heat solver with moving laser + Neumann BC (explicit)
+
 #===============================
 #          LIBRARIES           #
 #===============================
@@ -23,7 +27,7 @@ from dolfinx.fem import Constant, Function, locate_dofs_topological
 
 mesh_path = "/home/ntinos/Documents/FEnics/heat equation/checkpoints/Dogbone3D.xdmf"
 output_dir = "results_explicit_evaporation_latent"
-output_filename = "laser_evaporation_latent_explicit.xdmf"
+output_filename = "laser_evaporation_latent_explicit2.xdmf"
 
 with io.XDMFFile(MPI.COMM_WORLD, mesh_path, "r") as xdmf:
     domain = xdmf.read_mesh(name="dogbone_mesh")
@@ -90,8 +94,10 @@ alpha = k / (rho * Cp)
 #         TIME SETTINGS        #
 #===============================
 
-time_params = {"t_end": 0.45, "Nsteps": 100000, "h_fine": 0.00002}
+time_params = {"t_end": 0.2, "Nsteps": 50000, "h_fine": 0.00002}
 dt = time_params["t_end"] / time_params["Nsteps"]
+dt1 = 3.0 * dt  # Adjusted time step below the solidus temperature
+dt2 = 0.01 * dt  # Further adjusted time step bove the solidus temperature
 
 CFL = time_params["h_fine"] ** 2 / (2 * alpha)
 print(f"Thermal diffusivity α = {alpha:.3e} m²/s")
@@ -141,6 +147,7 @@ sigma_sb = Constant(domain, PETSc.ScalarType(5.670374419e-8))  # Stefan–Boltzm
 T_amb = Constant(domain, PETSc.ScalarType(T_room))             # Ambient temp (room)
 emissivity = Constant(domain, PETSc.ScalarType(0.35))           # Material emissivity (adjust as needed)
 
+
 #===============================
 #      EVAPORATION TERM        #
 #===============================
@@ -183,9 +190,9 @@ Q_rad = emissivity * sigma_sb * (T_n**4 - T_amb**4)
 L_form_expr = (
     -k * dot(grad(T_n), grad(T_test)) * dx
     + g_fun * T_test * ds_laser
-    - Q_evap_expr * T_test * ds_laser
-    - Q_rad * T_test * ds_laser
-    - rho * L_fusion * dXdt * T_test * dx
+    #- Q_evap_expr * T_test * ds_laser
+    #- Q_rad * T_test * ds_laser
+    #- rho * L_fusion * dXdt * T_test * dx
 )
 
 rhs_form = fem.form(L_form_expr)
@@ -221,9 +228,25 @@ start_time = time.time()
 #          TIME LOOP           #
 #===============================
 
+t = 0.0
+n = 0
+t_end = time_params["t_end"]
+
 with io.XDMFFile(domain.comm, output_path, "a") as xdmf:
-    for n in range(time_params["Nsteps"]):
-        t = (n + 1) * dt
+    while t < t_end:
+        # Choose time step based on temperature at probe (or global max)
+        T_probe = T_n.x.array[top_dof[0]] if len(top_dof) > 0 else T_room
+        if T_probe < material["T_solidus"]:
+            dt_current = dt1
+        else:
+            dt_current = dt2
+
+        # Prevent overshooting final time
+        if t + dt_current > t_end:
+            dt_current = t_end - t
+
+        t += dt_current
+        n += 1
 
         # Laser interpolation
         g_fun.interpolate(lambda x: laser(x, t).astype(PETSc.ScalarType))
@@ -232,8 +255,7 @@ with io.XDMFFile(domain.comm, output_path, "a") as xdmf:
         T_sol.x.array[:] = T_n.x.array
         X_melt_prev.x.array[:] = X_melt.x.array
         X_melt.interpolate(fem.Expression(melt_fraction(T_sol), Vt.element.interpolation_points()))
-        dXdt.x.array[:] = (X_melt.x.array - X_melt_prev.x.array) / dt
-
+        dXdt.x.array[:] = (X_melt.x.array - X_melt_prev.x.array) / dt_current
 
         # RHS assembly
         b = assemble_vector(rhs_form)
@@ -243,7 +265,7 @@ with io.XDMFFile(domain.comm, output_path, "a") as xdmf:
         # Explicit update
         start, end = Vt.dofmap.index_map.local_range
         owned = np.arange(start, end, dtype=np.int32)
-        T_n.x.array[owned] += dt * b.array[owned] * M_inv
+        T_n.x.array[owned] += dt_current * b.array[owned] * M_inv
         T_n.x.scatter_forward()
 
         for bc in bcs:
@@ -254,25 +276,26 @@ with io.XDMFFile(domain.comm, output_path, "a") as xdmf:
             T_val = T_n.x.array[top_dof[0]]
             top_temp.append(T_val)
             time_series.append(t)
-            if n % 100 == 0 or n == time_params["Nsteps"] - 1:
-                print(f"Step {n+1:05d} | Time: {t:.4f} | T_center: {T_val:.2f} K")
+            if n % 100 == 0 or t >= t_end:
+                print(f"Step {n:05d} | Time: {t:.6f} s | T_center: {T_val:.2f} K | dt = {dt_current:.2e}")
 
-        if n % 10 == 0:
+        if n % 10 == 0 or t >= t_end:
             xdmf.write_function(T_n, t)
 
-elapsed_time = time.time() - start_time
-print(f"\nExplicit simulation complete. {len(top_temp)} steps recorded.")
-print(f"Maximum temperature reached: {np.max(top_temp):.2f} K")
-print(f"Total CPU time: {elapsed_time:.2f} seconds")
 
 if MPI.COMM_WORLD.rank == 0:
-    #txt_path = os.path.join(output_dir, "nonlin_h0.01.txt")
-    txt_path = os.path.join(output_dir, "nonlin_las_evap_radiation.txt")
+    #txt_path = os.path.join(output_dir, "nonlin_h0.02.txt")
+    txt_path = os.path.join(output_dir, "nonlin_all_dynamic_tstep.txt")
     with open(txt_path, "w") as f:
         f.write("# Time [s] \t Temperature [K]\n")
         for t_val, T_val in zip(time_series, top_temp):
             f.write(f"{t_val:.6e}\t{T_val:.6f}\n")
     print(f"Saved probe data to: {txt_path}")
+
+elapsed_time = time.time() - start_time
+print(f"\nExplicit simulation complete. {len(top_temp)} steps recorded.")
+print(f"Maximum temperature reached: {np.max(top_temp):.2f} K")
+print(f"Total CPU time: {elapsed_time:.2f} seconds")
 
 #===============================
 #            PLOT              #
@@ -288,5 +311,6 @@ if MPI.COMM_WORLD.rank == 0:
     plt.grid(True)
     plt.tight_layout()
     plot_path = os.path.join(output_dir, "T_vs_time_probe_point_latent.png")
+    plt.savefig(plot_path, dpi=300)
     plt.show()
     print(f"Saved plot to: {plot_path}")

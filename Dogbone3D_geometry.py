@@ -1,6 +1,5 @@
 # # 22.06.2025 
-# This code creates the specimen geometry for the Heat conduction problem and creates 
-# an XDMF file with the mesh that is called in the code of Heat3D_dogbone.py 
+# This code creates the sample geometry for the Heat conduction problem and creates an XDMF file with the mesh that is called in the code of Heat3D_dogbone.py #
 
 #=================================
 #           LIBRARIES            #
@@ -24,7 +23,7 @@ fdim = gdim - 1 # dimension of the facets where the boundary conditions will be 
 if mesh_comm.rank == model_rank:
     gmsh.model.add("dogbone_mesh") # Add a new Gmsh model with a given name
     gmsh.model.setCurrent("dogbone_mesh")
-    occ = gmsh.model.occ           # Get the OpenCASCADE CAD kernel interface
+    occ = gmsh.model.occ           # Get the OpenCASCADE CAD kernel interface -  this is the kernell that is repsonsilbe for the complex geometry handling
 
     gmsh.initialize()
 
@@ -38,8 +37,8 @@ if mesh_comm.rank == model_rank:
     fillet_radius = 13.5 * unit
     end_length_straight = 16 * unit
 
-    h_mesh = 1.0 * unit
-    h_fine = 0.02 * unit
+    h_mesh = 1.2 * unit
+    h_fine = 0.01* unit   # thats the size of the element, at the region of the refinement- where the laser scanning is happening
 
     gaude_radius = gauge_diameter / 2.0
     end_radius = end_diameter / 2.0
@@ -55,7 +54,7 @@ if mesh_comm.rank == model_rank:
     #          Geometry
     # ============================
 
-    # the following are the ponins that defines the outline of the geometry
+    # the following are the ponins that define the outline of the geometry
     p = [
         occ.add_point(x_outer_end, 0, 0),
         occ.add_point(x_outer_end, end_radius, 0),
@@ -85,14 +84,14 @@ if mesh_comm.rank == model_rank:
     }
     # # Create a closed loop from the defined line segments (edges of the 2D profile)
     # This loop outlines the cross-sectional shape of the dogbone specimen
-    curve_loop = occ.add_curve_loop([lines[k] for k in lines])
+    curve_loop = occ.add_curve_loop([lines[k] for k in lines]) # creates a closed loop of curves that define the boundary of the surface
     
     # Create a planar surface bounded by the curve loop
     # This surface represents the 2D profile that will be revolved into a 3D volume
-    surface = occ.add_plane_surface([curve_loop])
+    surface = occ.add_plane_surface([curve_loop]) # it takes the closed loop and creates a surface inside it 
     # Synchronize the OpenCASCADE kernel with the Gmsh model
     # This is required before performing further operations like revolve or meshing
-    occ.synchronize()
+    occ.synchronize() # commits all the geometry operations
 
     # ============================
     # Revolve
@@ -103,7 +102,7 @@ if mesh_comm.rank == model_rank:
 
     # Get the tag of the newly created 3D volume
 
-    volume_tag = next((e[1] for e in revolved if e[0] == 3), None)
+    volume_tag = next((e[1] for e in revolved if e[0] == 3), None) # that tells python to find the first revolved entity that is a volume 
     assert volume_tag
 
     # ============================
@@ -119,7 +118,7 @@ if mesh_comm.rank == model_rank:
     # 2. Create a band surface by extruding the gauge line to give it axial thickness
     # We'll extrude the top gauge line symmetrically ± along Z to make a thin surface band.
 
-    band_half_length = 0.5 * unit  # 0.5 mm up, 0.5 mm down → 1 mm band
+    band_half_length = 0.3 * unit  # 0.5 mm up, 0.5 mm down → 1 mm band
     extrusions = []
 
     for l in refined_lines:
@@ -136,7 +135,7 @@ if mesh_comm.rank == model_rank:
     band_surfaces = [e[1] for e in extrusions if e[0] == 2]
 
     # ===============================
-    # 3. Distance field to the band surfaces
+    # 3. Distance field to the band surfaces - standard mesh refinement steps-check Corrando Maurini tutorials on fracture mechanics
     gmsh.model.mesh.field.add("Distance", 1)
     gmsh.model.mesh.field.setNumbers(1, "SurfacesList", band_surfaces)
     gmsh.model.mesh.field.setNumber(1, "NumPointsPerCurve", 100)
@@ -154,20 +153,23 @@ if mesh_comm.rank == model_rank:
     # 5. Set this as the background mesh
     gmsh.model.mesh.field.setAsBackgroundMesh(2)
 
-    # ===============================
+    # ===============================   
     # 6. Still enforce global max mesh size as a fallback
     gmsh.option.setNumber("Mesh.MeshSizeMax", h_mesh)
 
     # ============================
     # Physical groups
     # ============================
-    gmsh.model.add_physical_group(3, [volume_tag], tag=1)
+    gmsh.model.add_physical_group(3, [volume_tag], tag=1) # mark the volume with the ID=1   
     gmsh.model.set_physical_name(3, 1, "DogboneVolume")
 
+    # Get all outer surfaces (faces) of the 3D volume so we can label them individually
     bnds = gmsh.model.get_boundary([(3, volume_tag)], oriented=False, combined=False)
     tol = 1e-6
+    # Lists to store surface tags based on their location
     left_face, right_face, laser_face, top_surf = [], [], [], []
 
+    # Loop through each boundary surface and determine its position using center of mass
     for dim, tag in bnds:
         com = gmsh.model.occ.get_center_of_mass(dim, tag)
         if math.isclose(com[0], -x_outer_end, abs_tol=tol):
@@ -179,18 +181,26 @@ if mesh_comm.rank == model_rank:
         else:
             laser_face.append(tag)
 
+    # assign physical groups to surfaces- labelling surfaces so they can be clearly identified
+    # Label the left-end surface group with tag=2 and name it 'LeftEnd'
     gmsh.model.add_physical_group(2, left_face, tag=2)
     gmsh.model.set_physical_name(2, 2, "LeftEnd")
+
+    # Label the right-end surface with tag=3 and name it 'RightEnd'
     gmsh.model.add_physical_group(2, right_face, tag=3)
     gmsh.model.set_physical_name(2, 3, "RightEnd")
+
+    # Label surfaces affected by laser with tag=4 and name it 'LaserSurface'
     gmsh.model.add_physical_group(2, laser_face, tag=4)
     gmsh.model.set_physical_name(2, 4, "LaserSurface")
+    
+    # Label the top surfaces (center area) with tag=5 and name it 'TopSurface'
     gmsh.model.add_physical_group(2, top_surf, tag=5)
     gmsh.model.set_physical_name(2, 5, "TopSurface")
 
-    occ.synchronize()
+    occ.synchronize() # Final sync to make sure all physical group definitions are saved to the geometry
 
-    print("\n=== Physical Groups ===")
+    print("\n=== Physical Groups ===") # safety check that the tags are sassigned correctly
     for d, tag in gmsh.model.getPhysicalGroups(3) + gmsh.model.getPhysicalGroups(2):
         print("Dim", d, "Tag", tag)
 
@@ -237,5 +247,5 @@ import pyvista as pv
 mesh = pv.read("dogbone_mesh.pvd")
 
 plotter = pv.Plotter()
-plotter.add_mesh(mesh, show_edges=True)
+plotter.add_mesh(mesh, show_edges=False)
 plotter.show(screenshot="dogbone_mesh.png")  #  Shows the window and saves the image

@@ -42,7 +42,6 @@ x_fillet_end = x_gauge_half + dx_fillet
 Vt = fem.functionspace(domain, ("Lagrange", 1))  # Define a Lagrange finite element space of degree 1
 T_room = 293.0   # Room temperature in Kelvin
 
-
 # Define the initial temperature condition as room temperature everywhere
 def initial_condition(x):
     return np.full(x.shape[1], T_room, dtype=PETSc.ScalarType)
@@ -65,22 +64,22 @@ material_params = {
     "k_therm": 15.0  # Thermal conductivity (W/m.K)
 }
 time_params = {
-    "t_end": 0.16,  # End time of the simulation (s)
-    "Nsteps": 12000,  # Number of time steps
+    "t_end": 0.25,  # End time of the simulation (s)
+    "Nsteps": 250000,  # Number of time steps
     "h_fine": 0.00002  # Characteristic mesh size for CFL condition (we add this for printing the CFL condition)
 }
 
 # --- Moving Laser Source (Callable) ---
 laser_params = {
     "Absorptivity": 0.30,  # Absorptivity of the material (dimensionless)
-    "Power": 70.0,  # Laser power (W)
+    "Power": 45.0,  # Laser power (W)
     "Radius": 60e-6,  # Laser spot radius (m)
-    "Scan_speed": 0.5,  # Laser scanning speed (m/s)
+    "Scan_speed": 0.15,  # Laser scanning speed (m/s)
     "y0": gauge_radius  # Initial y-coordinate for the laser
 }
 
 alpha = material_params["k_therm"] / (material_params["rho"] * material_params["Cp"])
-print(f"✅ Thermal diffusivity α = {alpha:.3e} m²/s")
+print(f"Thermal diffusivity α = {alpha:.3e} m²/s")
 
 CFL = time_params["h_fine"]**2 / (2*alpha)
 t = time_params["t_end"] / time_params["Nsteps"]
@@ -133,12 +132,10 @@ time_series, center_temp, T_final = heatdiff_explicit_solver(
 
 import matplotlib.pyplot as plt
 
-#np.savetxt("mesh_size0.01_3D_0.16.txt", np.column_stack((time_series, center_temp)), fmt="%.6e", header="time, center_temp", comments="# ")
+#np.savetxt("lin_h0.0025.txt", np.column_stack((time_series, center_temp)), fmt="%.6e", header="time, center_temp", comments="# ")
 #np.savetxt("SpeedP70_v1.0.txt", np.column_stack((time_series, center_temp)), fmt="%.6e", header="time, center_temp", comments="# ")
 #np.savetxt("Speedv0.1_P70.txt", np.column_stack((time_series, center_temp)), fmt="%.6e", header="time, center_temp", comments="# ")
-np.savetxt("Scenario3_P70_v0.5.txt0", np.column_stack((time_series, center_temp)), fmt="%.6e", header="time, center_temp", comments="#") 
-
-
+np.savetxt("lin_Scenario3_P45_v0.15.txt", np.column_stack((time_series, center_temp)), fmt="%.6e", header="time, center_temp", comments="#") 
 
 # Plot the temperature at the laser center over time if running on the root MPI process
 if MPI.COMM_WORLD.rank == 0:

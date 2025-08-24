@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt            # Library to plot the results
 #=====================================
 
 mesh_path = "/home/ntinos/Documents/FEnics/heat equation/checkpoints/Dogbone3D.xdmf"          # path to the mesh file
-output_dir, output_filename = "results_nonlinear_evaporation", "nonlinear_final.xdmf" # output folder and xdmf name
+output_dir, output_filename = "results_nonlinear_evaporation", "nonlinear_final.xdmf"         # output folder and xdmf name
 os.makedirs(output_dir, exist_ok=True)                                                        # Create the output directory if it doesn't already exist
 output_path = os.path.join(output_dir, output_filename)
 
@@ -54,7 +54,7 @@ left_dofs = fem.locate_dofs_topological(Vt, fdim, facet_tags.indices[facet_tags.
 right_dofs = fem.locate_dofs_topological(Vt, fdim, facet_tags.indices[facet_tags.values == 3])# ID 2 and 3 are assigned in the Dogbone3D_geometry.py
 
 #----- laser surface------
-ds_surface = Measure("ds", domain=domain, subdomain_data=facet_tags, subdomain_id=5)           # Defines a surface measure for integration over the laser-exposed boundary (facet tag 5)
+ds_surface = Measure("ds", domain=domain, subdomain_data=facet_tags, subdomain_id=5)          # Defines a surface measure for integration over the laser-exposed boundary (facet tag 5)
 
 #=====================================
 #           DICTIONARIES             
@@ -69,6 +69,8 @@ Stainless_Steel = {
     "T_liquidus": 1800.0,                # Liquidus temperature (K)
     "latent_heat_fusion": 267.7e3,       # Latent heat of fusion
     "latent_heat_evaporation": 7.41e6,   # latent heat of evaporation
+    "Emissivity": 0.35,                  # for the radiaion
+    "Stefan_Boltzmann": 5.670e-8          
 }
 
 Environment_conditions = {
@@ -92,7 +94,7 @@ laser_parameters = {
 #           TIME STEP           
 #=====================================
 
-t_end, Nsteps = 0.05, 5000    
+t_end, Nsteps = 0.45, 60000   
 dt = t_end/Nsteps  
 
 #=====================================
@@ -152,40 +154,38 @@ latent_heat_fusion = Stainless_Steel["latent_heat_fusion"]
 Pa, Rv = Environment_conditions["Atmospheric_Pressure"], Environment_conditions["Gas_constant"]
 deltaH_lv, T_boil = Stainless_Steel["latent_heat_evaporation"], Stainless_Steel["T_boil"]
 
-prefactor = 0.01 * Pa*deltaH_lv/ ufl.sqrt(2 * np.pi * Rv * T_boil) # W/m^2
+prefactor = 0.82 * Pa*deltaH_lv/ ufl.sqrt(2 * np.pi * Rv * T_sol) # W/m^2
 # Define evaporation heat loss as a temperature-dependent function (nonlinear)
 # This term will act as a surface heat sink in the variational formulation
 Q_evap = prefactor * exp ((deltaH_lv/ (T_boil*Rv))* (1-(T_boil / T_sol)))
+# radiation term
+sigma = Stainless_Steel["Stefan_Boltzmann"]
+epsilon = Stainless_Steel["Emissivity"]
+Q_rad = epsilon * sigma * (T_sol**4 - T_room**4)
                           
-#--------latent heat of fusion term---------
-
-# --- Constants ---
-k_liq = 0.02
-n_liq = 1.22
-
-# --- Step 1: Define KM-based melt fraction expression as a UFL expression based on T_n (previous step) ---
 X_melt_expr = ufl.conditional(
     ufl.lt(T_n, T_solidus), PETSc.ScalarType(0.0),
     ufl.conditional(
         ufl.gt(T_n, T_liquidus), PETSc.ScalarType(1.0),
-        (T_n - T_solidus)/ (T_liquidus - T_solidus)
+        (T_n - T_solidus) / (T_liquidus - T_solidus)
     )
 )
 
-# --- Step 2: Create function to store current melt fraction ---
-# Create containers (this is fine)
-X_melt_now = fem.Function(Vt, name="X_melt_now")
-X_melt_prev = fem.Function(Vt, name="X_melt_prev")
-X_melt_prev.interpolate(lambda x: np.zeros(x.shape[1], dtype=PETSc.ScalarType))
+dXdt = ufl.conditional(
+    ufl.And(ufl.ge(T_n, T_solidus), ufl.le(T_n, T_liquidus)),
+    1.0 / (T_liquidus - T_solidus) * (T_sol - T_n) / dt,
+    PETSc.ScalarType(0.0)
+)
 
-Q_latent = fem.Function(Vt, name="Q_latent")
-
+# --- Latent heat source term (analytical) ---
+Q_latent = rho * latent_heat_fusion * dXdt
 
 Residual = (rho * Specific_heat* (T_sol-T_n)/dt) * T_test *dx \
            + k *  dot (grad(T_sol), grad(T_test))*dx \
            - laser_func * T_test * ds\
-           + Q_evap * T_test * ds\
-           + Q_latent * T_test * dx
+           #+ Q_evap * T_test * ds\
+           #+ Q_rad * T_test * ds\
+           #+ Q_latent * T_test * dx
 
 # --- Jacobian of the Residual ---
 Jacobian = derivative (Residual, T_sol, T_trial) # that means that the jacobian is computed in the direction of the trial function (check J.Bleyer hyperelasticity)
@@ -195,7 +195,7 @@ problem = fem.petsc.NonlinearProblem(Residual, T_sol, bcs)
 solver = nls.petsc.NewtonSolver(domain.comm, problem)    # Set a Newton solver for the nonlinear problem
 # Set linear solver type for the inner Krylov iteration (used in each Newton step)
 solver.krylov_solver.setType("gmres")     # GMRES(solver) for general nonlinear systems
-solver.krylov_solver.getPC().setType("gamg")  # select the preconditioner (ilu works well for the problem)
+solver.krylov_solver.getPC().setType("ilu")  # select the preconditioner (ilu works well for the problem)
 solver.krylov_solver.getPC().setReusePreconditioner(True)
 solver.krylov_solver.setTolerances(rtol=1e-6, atol=1e-8, max_it=1000)
 
@@ -224,11 +224,11 @@ start = time.time()
 with io.XDMFFile(domain.comm, output_path, "a") as xdmf:
     
     # Time-stepping loop
-    Nsteps = 2000
-    for n in range(Nsteps):
+    
+    for n in range(10000):
         t = (n + 1) * dt  # Compute current simulation time
 
-        # Interpolate the time-dependent laser source at current time t
+        # Interpolate the time-dependent laser source at current time tNsteps
         laser_func.interpolate(
             lambda x: laser_source_func(x, t).astype(PETSc.ScalarType)
         )
@@ -243,19 +243,6 @@ with io.XDMFFile(domain.comm, output_path, "a") as xdmf:
         if not converged:
             raise RuntimeError(f"Solver failed at t = {t:.4f}s after {its} iterations.")
 
-               
-        # Evaluate melt fraction at current step
-        X_melt_now.interpolate(fem.Expression(X_melt_expr, Vt.element.interpolation_points()))
-
-        # Compute dX/dt and update latent heat
-        epsilon = 1e-6  # or smaller/larger depending on your time scale
-        dXdt = (X_melt_now.x.array - X_melt_prev.x.array) / (dt + epsilon)
-        dXdt = (X_melt_now.x.array - X_melt_prev.x.array) / dt
-        Q_latent.x.array[:] = rho * latent_heat_fusion * dXdt
-
-        # Store melt fraction for next time step
-        X_melt_prev.x.array[:] = X_melt_now.x.array
-
         # --------------------------------------------------------------------------
 
         # Update the previous solution with the current one for the next time step
@@ -263,7 +250,7 @@ with io.XDMFFile(domain.comm, output_path, "a") as xdmf:
 
         # Write the current temperature field to the XDMF output file with time tag
         
-        if (n+1)% 100 == 0 or n == Nsteps-1:
+        if (n+1)% 5000 == 0 or n == Nsteps-1:
              xdmf.write_function(T_sol, t)
 
         # If a probe degree of freedom (DOF) is defined, extract and store the temperature at that point
@@ -275,9 +262,7 @@ with io.XDMFFile(domain.comm, output_path, "a") as xdmf:
                 f"Step {n+1:03d} | Time: {t:.4f}s | Probe Temp: {T_top:.2f} K | Newton iterations: {its}"
             )
             print(f"Max T: {T_sol.x.array.max():.2f} K")
-            print(f"Max dX/dt: {np.max(dXdt):.2e}")
-            print(f"Max Q_latent: {np.max(Q_latent.x.array):.2e}")
-
+            
         else:
             # If no probe DOF is found, just print status
             print(
@@ -289,12 +274,13 @@ print(f"Simulation complete at t = {time.time()-start:.2f} seconds")
 
 
 # --- Save probe temperature history ---
-#output_txt = os.path.join(output_dir, "nonlin_cg_none1.5.txt")
+#output_txt = os.path.join(output_dir, "nonlin_Scenario4_P200_v0.8.txt")
+output_txt = os.path.join(output_dir, "laser.txt")
 
-#with open(output_txt, "w") as f:
-#    f.write("# Time (s)\tTemperature (K)\n")
-#    for t, T in zip(time_series, top_temps):
-#        f.write(f"{t:.6f}\t{T:.2f}\n")
+with open(output_txt, "w") as f:
+    f.write("# Time (s)\tTemperature (K)\n")
+    for t, T in zip(time_series, top_temps):
+        f.write(f"{t:.6f}\t{T:.2f}\n")
 
 # --- Plotting ---
 plt.figure(figsize=(10, 6))

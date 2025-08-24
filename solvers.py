@@ -14,6 +14,8 @@ from ufl import dx
 from dolfinx.fem.petsc import assemble_vector, assemble_matrix, set_bc # used for the variational formulation in the explicit scheme
 from dolfinx.fem import Constant, Function, locate_dofs_geometrical, set_bc 
 import time
+from dolfinx import geometry # used for the variational formulation in the explicit scheme
+from dolfinx.fem.petsc import assemble_vector, assemble_matrix, create_vector, apply_lifting, set_bc
 
 #======================================
 #           IMPLICIT SCHEME           #
@@ -99,12 +101,12 @@ def heatdiff_implicit_solver(domain, Vt, bcs, material_params, time_params,
         xdmf.write_function(T_n, 0.0)
 
     # Define a probe point to monitor temperature during the simulation
-    def probe_point(x, tol=1e-8):
-        return (
-           (np.abs(x[0] - 0.004) < tol) &
-           (np.abs(x[1] - 0.0025) < tol) 
+    #def probe_point(x, tol=1e-8):
+    #    return (
+    #       (np.abs(x[0] - 0.004) < tol) &
+    #       (np.abs(x[1] - 0.0025) < tol) 
            
-    )
+    #)
 
     def probe_point(x, tol=1e-8):
         return (
@@ -167,7 +169,6 @@ def heatdiff_implicit_solver(domain, Vt, bcs, material_params, time_params,
     print(f"\n Simulation finished in {elapsed_time:.2f} seconds.")
     return time_series, top_temperatures, T_sol
 
-
 #======================================
 #           EXPLICIT SCHEME           #
 #======================================
@@ -177,158 +178,184 @@ def heatdiff_explicit_solver(domain, Vt, bcs, material_params, time_params,
                              output_dir, output_filename,
                              bc_update_func=None, source_bc=None,
                              neumann_bcs=None):
-    # Parameters
-    rho, Cp, k = material_params["rho"], material_params["Cp"], material_params["k_therm"]
-    t_end, Nsteps = time_params["t_end"], time_params["Nsteps"]
-    dt = t_end / Nsteps
-    mesh_comm = domain.comm
-    print(f"Time step used: {dt:.7f} seconds")
+    # Create the output directory if it does not already exist
+    os.makedirs(output_dir, exist_ok=True) # create output directory if it doesn't exist
+    output_path = os.path.join(output_dir, output_filename) # the path where the xdmf files are saved
 
-    # Initial condition
-    T_n = Function(Vt)
-    T_n.name = "Temperature"
+    # Extract material parameters from the dictionary
+    rho, Cp, k = material_params["rho"], material_params["Cp"], material_params["k_therm"]
+    # Extract time parameters from the dictionary
+    t_end, Nsteps = time_params["t_end"], time_params["Nsteps"]
+    # Calculate the time step size
+    dt = t_end / Nsteps # time step size
+    print(f"Time step used:{dt:.7f} seconds")
+    # Get the MPI communicator associated with the mesh
+    mesh_comm = domain.comm # communicator for the mesh
+
+    # Functions for the finite element problem
+    T_n = fem.Function(Vt) # function to store the solution
+    T_n.name = "Temperature_n" # Function to store the previous time step solution
     T_n.interpolate(initial_condition)
 
-    T_test = TestFunction(Vt)
+    T_test = TestFunction(Vt)  # Define the test function (v)
+    T_trial = TrialFunction(Vt)  # Define the trial function (T)
+    T_sol = fem.Function(Vt, name="Temperature")
 
-    # Mass lumping
-    one = fem.Function(Vt)
-    one.interpolate(lambda x: np.ones_like(x[0]))
-    mass_form_lump = fem.form(rho * Cp * one * T_test * dx)
-    M_lump_vec = assemble_vector(mass_form_lump)
-    M_lump_vec.assemble()
-    M_lumped_inv_array = 1.0 / M_lump_vec.array
-
-    # Time-dependent source setup
-    from collections import deque
-    time_dependent_source = False
+    # Handle source term: constant/function/callable
+    from dolfinx.fem import Constant, Function
     if isinstance(source_term, (Constant, Function)):
         f = source_term
+        time_dependent_source = False
     elif callable(source_term):
-        f = Function(Vt)
-        time_dependent_source = True
+        f = fem.Function(Vt)
         def f_expr(x): return source_term(x, 0.0).astype(PETSc.ScalarType)
         f.interpolate(f_expr)
+        time_dependent_source = True
     else:
-        raise TypeError("source_term must be Constant, Function, or callable")
+        raise TypeError("source_term must be a dolfinx Constant, Function, or callable (x, t) → array")
 
-    # Handle Neumann BCs
+    # Variational problem
+    a = (rho * Cp / dt) * T_trial * T_test * ufl.dx
+
+    
+    # Define the base right-hand side (RHS) of the variational form (L(T_test))
+    # This represents the known terms from the previous time step and the source
+    L_form_expr = (rho * Cp / dt * T_n + f) * T_test * ufl.dx - k * dot(grad(T_n), grad(T_test)) * ufl.dx
+
     neumann_funcs = []
-    L_form_expr = -k * dot(grad(T_n), grad(T_test)) * dx + f * T_test * dx
 
+    # Handle Neumann boundary conditions if provided
     if neumann_bcs is not None:
-        for g, ds_measure in neumann_bcs:
-            if isinstance(g, (Constant, Function)):
-                L_form_expr += g * T_test * ds_measure
-                neumann_funcs.append((None, g))  # static
-            elif callable(g):
-                g_fun = Function(Vt)
-                def g_expr(x, g_=g): return g_(x, 0.0).astype(PETSc.ScalarType)
-                g_fun.interpolate(g_expr)
-                L_form_expr += g_fun * T_test * ds_measure
-                neumann_funcs.append((g, g_fun))  # dynamic
-            else:
-                raise TypeError("Neumann BC 'g' must be Constant, Function, or callable")
+       for g, ds_measure in neumann_bcs:
+           if isinstance(g, (fem.Constant, fem.Function)):
+              L_form_expr += g * T_test * ds_measure
+              neumann_funcs.append((None, g))  # static
+           elif callable(g):
+              g_fun = fem.Function(Vt)
+              def g_expr(x, g_=g): return g_(x, 0.0).astype(PETSc.ScalarType)
+              g_fun.interpolate(g_expr)
+              L_form_expr += g_fun * T_test * ds_measure
+              neumann_funcs.append((g, g_fun))  # time-dependent
+           else:
+            raise TypeError("Neumann BC 'g' must be Constant, Function, or callable.")
 
-    rhs_form = fem.form(L_form_expr)
+    L_form = (L_form_expr)
 
-    # Output setup
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, output_filename)
+    # Convert to forms
+    bilinear_form = fem.form(a)
+    linear_form = fem.form(L_form_expr)
+
+    # Assemble A (mass matrix) once
+    A = fem.petsc.assemble_matrix(bilinear_form, bcs)
+    A.assemble()
+
+    # Create vector for RHS
+    b = fem.petsc.create_vector(linear_form)
+
+    # Setup solver
+    solver = PETSc.KSP().create(domain.comm)
+    solver.setOperators(A)
+    solver.setType(PETSc.KSP.Type.PREONLY)       # Only solve once per step
+    solver.getPC().setType(PETSc.PC.Type.LU)     # You can replace with 'jacobi' or 'sor'
+
+
+    # Output file setup
     with io.XDMFFile(mesh_comm, output_path, "w") as xdmf:
         xdmf.write_mesh(domain)
         xdmf.write_function(T_n, 0.0)
 
-    # Probe point (only for rosenthal)
-    #def probe_point(x, tol=1e-8):
-    #    return (
-    #       (np.abs(x[0] - 0.04) < tol) &
-    #       (np.abs(x[1] - 0.01) < tol) &
-    #       (np.abs(x[2] - 0.002) < tol)
-    #)
-
-    # Probe point (for the Dogbone)
+    # Define a probe point to monitor temperature during the simulation
     #def probe_point(x, tol=1e-8):
     #    return (
     #       (np.abs(x[0] - 0.004) < tol) &
-    #       (np.abs(x[1] - 0.0025) < tol) &
-    #       (np.abs(x[2] - 0.0) < tol)
+    #       (np.abs(x[1] - 0.0025) < tol)       
     #)
 
-    # Probe point
-    def probe_point(x, tol=1e-8):
+    #def probe_point(x, tol=1e-8):
+    #    return (
+    #      (np.abs(x[0] - 0.0) < tol) &
+    #      (np.abs(x[1] - 0.0) < tol) 
+           
+    #)
+
+        # Probe point (only for rosenthal)
+    def probe_point(x, tol=1e-6):
         return (
-           (np.abs(x[0] - 0.0) < tol) &
-           (np.abs(x[1] - 0.0) < tol) &
-           (np.abs(x[2] - 0.0) < tol)
+           (np.abs(x[0] - 0.010) < tol) &
+           (np.abs(x[1] - 0.005) < tol) &
+           (np.abs(x[2] - 0.001) < tol)
     )
 
-    top_dof = locate_dofs_geometrical(Vt, probe_point)
+    # Locate the degrees of freedom (DoFs) that are geometrically close to the probe point
+    top_dof = fem.locate_dofs_geometrical(Vt, probe_point)
+    if len(top_dof) == 0:
+        print("Warning: No DOF found at domain center (0.5, 0.5)")
 
-    top_temp = []
+    top_temperatures = []
     time_series = []
 
     start_time = time.time()
-    T_max = -np.inf  # start with something lower than any real temperature
 
-
-    # Time stepping
     with io.XDMFFile(mesh_comm, output_path, "a") as xdmf:
         for n in range(Nsteps):
-            t = (n + 1) * dt
+            current_time = (n + 1) * dt
 
+            # Update time-dependent source term if needed
             if time_dependent_source:
-                def f_expr(x): return source_term(x, t).astype(PETSc.ScalarType)
-                f.interpolate(f_expr)
+                f.interpolate(lambda x: source_term(x, current_time).astype(PETSc.ScalarType))
 
+            # Update Neumann BCs if needed
             for g_callable, g_fun in neumann_funcs:
                 if g_callable is not None:
-                    def g_expr(x, g_=g_callable): return g_(x, t).astype(PETSc.ScalarType)
-                    g_fun.interpolate(g_expr)
+                    g_fun.interpolate(lambda x, g_=g_callable: g_(x, current_time).astype(PETSc.ScalarType))
 
+            # Update Dirichlet BCs if needed
             if bc_update_func is not None and source_bc is not None:
-                source_bc.t = t
+                source_bc.t = current_time
                 bc_update_func.interpolate(lambda x: source_bc(x))
 
-            b = assemble_vector(rhs_form)
+            # Assemble RHS vector
+            with b.localForm() as loc_b:
+                loc_b.set(0.0)
+            fem.petsc.assemble_vector(b, linear_form)
+            fem.petsc.apply_lifting(b, [bilinear_form], [bcs])
             b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
-            set_bc(b, bcs)
+            fem.petsc.set_bc(b, bcs)
 
-            start, end = Vt.dofmap.index_map.local_range
-            owned = np.arange(start, end, dtype=np.int32)
+            # Solve A * T_sol = b
+            solver.solve(b, T_sol.x.petsc_vec)
+            T_sol.x.scatter_forward()
 
-            T_n.x.array[owned] += dt * b.array[owned] * M_lumped_inv_array
-            T_n.x.scatter_forward()
+            # Update previous time step
+            T_n.x.array[:] = T_sol.x.array
 
-            for bc in bcs:
-                bc.set(T_n.x.array, None)
-
-            current_max = np.max(T_n.x.array) # max of all DOFs this step
-
-            if current_max > T_max:
-                T_max = current_max
-
+            # Monitor center
             if len(top_dof) > 0:
-                T_val = T_n.x.array[top_dof[0]]
-                top_temp.append(T_val)
-                time_series.append(t)
-                if n % 100 == 0 or n == Nsteps - 1:
-                    print(f"Step {n+1:05d} | Time: {t:.4f} | T_center: {T_val:.6f}")
-            if n % 10 == 0:
-                xdmf.write_function(T_n, t)
+                T_top = T_sol.x.array[top_dof[0]]
+                top_temperatures.append(T_top)
+                time_series.append(current_time)
+                if (n + 1) % 100 == 0:
+                    print(f"Step {n+1:04d} | Time: {current_time:.4f} | T_top: {T_top:.6f}")
+            elif (n + 1) % 100 == 0:
+                print(f"Step {n+1:04d} | Time: {current_time:.4f} | Warning: No center DOF found")
 
-    print(f"\n Explicit simulation complete. {len(top_temp)} steps recorded.")
-    elapsed_time = time.time() - start_time
-    print(f" Maximum temperature reached: {T_max:.2f} K")
-    print(f" Total CPU time: {elapsed_time:.2f} seconds")
+            # Save output
+            if (n + 1) % 1000 == 0 or n == Nsteps - 1:
+                xdmf.write_function(T_sol, current_time)
 
-    return time_series, top_temp, T_n
+
+        elapsed_time = time.time() - start_time
+        print(f"\nSimulation finished in {elapsed_time:.2f} seconds.")
+
+    return time_series, top_temperatures, T_sol
 
 
 #======================================
 #            THETA-SCHEME             #
 #======================================
 def heatdiff_theta_solver(domain, Vt, bcs, material_params, time_params,
+                          
+                          
                           initial_condition, source_term,
                           output_dir, output_filename,
                           theta=1.0,
@@ -393,42 +420,45 @@ def heatdiff_theta_solver(domain, Vt, bcs, material_params, time_params,
         xdmf.write_mesh(domain)
         xdmf.write_function(T_n, 0.0)
 
-   # Probe point (only for rosenthal)
-    #def probe(x, tol=1e-8):
+   # Define a probe point to monitor temperature during the simulation
+    #def probe_point(x, tol=1e-8):
     #    return (
-    #       (np.abs(x[0] - 0.04) < tol) &
-    #       (np.abs(x[1] - 0.01) < tol) &
-    #       (np.abs(x[2] - 0.002) < tol)
+    #       (np.abs(x[0] - 0.004) < tol) &
+    #       (np.abs(x[1] - 0.0025) < tol)       
     #)
 
-    # Probe point for the simple diffusion 
-    #def probe(x, tol=1e-8):
+    #def probe_point(x, tol=1e-8):
     #    return (
-    #       (np.abs(x[0] - 0.0) < tol) &
-    #       (np.abs(x[1] - 0.0) < tol) 
-    #    )
+    #      (np.abs(x[0] - 0.0) < tol) &
+    #      (np.abs(x[1] - 0.0) < tol) 
+           
+    #)
 
-    # Probe point for the dogbone
-    def probe(x, tol=1e-8):
+        # Probe point (only for rosenthal)
+    def probe_point(x, tol=1e-6):
         return (
-           (np.abs(x[0] - 0.004) < tol) &
-           (np.abs(x[1] - 0.0025) < tol) &
-           (np.abs(x[2] - 0.0) < tol)
+           (np.abs(x[0] - 0.010) < tol) &
+           (np.abs(x[1] - 0.005) < tol) &
+           (np.abs(x[2] - 0.001) < tol)
     )
 
-    top_dof = fem.locate_dofs_geometrical(Vt, probe)
+    top_dof = fem.locate_dofs_geometrical(Vt, probe_point)
     top_temp, time_series = [], []
     start_time = time.time() # Start timer for simulation duration
 
-    # Precompute mass lumping for the explicit part of the scheme (when theta = 0.0)
-    # This block is only entered if theta is exactly 0.0
     if theta == 0.0:
-        one = fem.Function(Vt) # Create a function of ones
-        one.interpolate(lambda x: np.ones_like(x[0])) # Interpolate 1.0 at all DoFs
-        mass_form_lump = fem.form(rho * Cp * one * T_test * dx) # Formulate lumped mass matrix diagonal
-        M_lump_vec = assemble_vector(mass_form_lump) # Assemble to a vector
-        M_lump_vec.assemble() # Finalize assembly
-        M_lumped_inv_array = 1.0 / M_lump_vec.array # Calculate inverse for direct multiplication
+        # Explicit scheme: assemble once
+        a_explicit = (rho * Cp / dt) * T_trial * T_test * ufl.dx
+        L_explicit = (rho * Cp / dt * T_n + f) * T_test * ufl.dx - k * dot(grad(T_n), grad(T_test)) * ufl.dx + L_neumann
+
+        A_explicit = fem.petsc.assemble_matrix(fem.form(a_explicit), bcs)
+        A_explicit.assemble()
+        b_explicit = fem.petsc.create_vector(fem.form(L_explicit))
+
+        solver = PETSc.KSP().create(domain.comm)
+        solver.setOperators(A_explicit)
+        solver.setType(PETSc.KSP.Type.PREONLY)
+        solver.getPC().setType(PETSc.PC.Type.LU)
 
     # Time-stepping loop
     for n in range(Nsteps):
@@ -453,20 +483,28 @@ def heatdiff_theta_solver(domain, Vt, bcs, material_params, time_params,
                                     petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
             problem.solve()
             T_n.x.array[:] = T_sol.x.array
-        else:
-            rhs = fem.form((-k * dot(grad(T_n), grad(T_test)) + f * T_test) * ufl.dx + L_neumann)
-            b = assemble_vector(rhs)
-            b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
-            set_bc(b, bcs)
+        elif theta == 0.0:
+            # Explicit scheme: assemble RHS using previous solution
+            a_explicit = (rho * Cp / dt) * T_trial * T_test * ufl.dx
+            L_explicit = (rho * Cp / dt * T_n + f) * T_test * ufl.dx - k * dot(grad(T_n), grad(T_test)) * ufl.dx + L_neumann
 
-            start, end = Vt.dofmap.index_map.local_range
-            owned = np.arange(start, end, dtype=np.int32)
+            A_explicit = fem.petsc.assemble_matrix(fem.form(a_explicit), bcs)
+            A_explicit.assemble()
+            b_explicit = fem.petsc.create_vector(fem.form(L_explicit))
 
-            T_n.x.array[owned] += dt * b.array[owned] * M_lumped_inv_array
-            T_n.x.scatter_forward()
-            for bc in bcs:
-                bc.set(T_n.x.array, None)
-            T_sol.x.array[:] = T_n.x.array
+            fem.petsc.assemble_vector(b_explicit, fem.form(L_explicit))
+            fem.petsc.apply_lifting(b_explicit, [fem.form(a_explicit)], [bcs])
+            b_explicit.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
+            fem.petsc.set_bc(b_explicit, bcs)
+
+            solver = PETSc.KSP().create(domain.comm)
+            solver.setOperators(A_explicit)
+            solver.setType(PETSc.KSP.Type.PREONLY)
+            solver.getPC().setType(PETSc.PC.Type.LU)
+
+            solver.solve(b_explicit, T_sol.x.petsc_vec)
+            T_sol.x.scatter_forward()
+            T_n.x.array[:] = T_sol.x.array
 
         # Monitor temperature at the probe point
         if len(top_dof) > 0: # Check if a probe DOF was successfully located
@@ -491,3 +529,55 @@ def heatdiff_theta_solver(domain, Vt, bcs, material_params, time_params,
     print(f"\n θ-solver complete. {len(top_temp)} steps recorded. Total CPU time: {elapsed_time:.2f} seconds.")
     # Return the time series, probe point temperatures, and the final temperature field
     return time_series, top_temp, T_sol
+
+
+
+#======================================
+#        NON - DIMENSIONALIZE         #
+#======================================
+def setup_nondimensionalizer(material_props, laser_params, T_room):
+    """
+    Returns nondimensionalization and redimensionalization functions
+    for temperature and time based on material and laser parameters.
+    """
+    # Extract physical constants
+    rho = material_props["Density"]
+    cp = material_props["Specific_heat"]
+    k = material_props["thermal_conductivity"]
+    T_boil = material_props["T_boil"]
+    R = laser_params["Radius"]
+
+    # Characteristic scales
+    T_char = T_boil - T_room
+    L_char = R
+    t_char = (rho * cp * R**2) / k
+
+    # --- Define conversion functions ---
+    def nondim_temperature(T):
+        return (T - T_room) / T_char
+
+    def redim_temperature(theta):
+        return theta * T_char + T_room
+
+    def nondim_time(t):
+        return t / t_char
+
+    def redim_time(tau):
+        return tau * t_char
+
+    def get_scales():
+        return {
+            "T_char": T_char,
+            "L_char": L_char,
+            "t_char": t_char
+        }
+
+    return {
+        "nondim_temperature": nondim_temperature,
+        "redim_temperature": redim_temperature,
+        "nondim_time": nondim_time,
+        "redim_time": redim_time,
+        "get_scales": get_scales
+    }
+
+
