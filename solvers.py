@@ -7,7 +7,7 @@ import os
 import numpy as np # linear algebra and numerical operations
 import ufl # finite element library for defining variational forms
 from ufl import TrialFunction, TestFunction, dot, grad
-from dolfinx import fem, io # finite element library for defining function spaces, boundary conditions, and solving problems
+from dolfinx import fem, io, nls # finite element library for defining function spaces, boundary conditions, and solving problems
 from dolfinx.fem.petsc import LinearProblem 
 from petsc4py import PETSc # PETSc library for solving linear algebra problems
 from ufl import dx
@@ -282,8 +282,8 @@ def heatdiff_explicit_solver(domain, Vt, bcs, material_params, time_params,
     def probe_point(x, tol=1e-6):
         return (
            (np.abs(x[0] - 0.010) < tol) &
-           (np.abs(x[1] - 0.005) < tol) &
-           (np.abs(x[2] - 0.001) < tol)
+           (np.abs(x[1] - 0.00495) < tol) &
+           (np.abs(x[2] - 0.000974) < tol)
     )
 
     # Locate the degrees of freedom (DoFs) that are geometrically close to the probe point
@@ -530,6 +530,139 @@ def heatdiff_theta_solver(domain, Vt, bcs, material_params, time_params,
     # Return the time series, probe point temperatures, and the final temperature field
     return time_series, top_temp, T_sol
 
+#======================================
+#        NEWTON TIME SOLVER           #
+#======================================
+def run_newton_time_solver(
+    *,
+    domain,                     # dolfinx mesh (for comm)
+    T_n,                        # fem.Function (previous step)
+    T_sol,                      # fem.Function (unknown/solution)
+    bcs,                        # list of Dirichlet BCs
+    Residual,                   # ufl form of residual
+    Jacobian,                   # ufl form of Jacobian (derivative(Residual, T_sol, T_trial))
+    t_end,                      # total simulated time
+    nsteps,                     # number of time steps
+    output_path,                # XDMF path for fields
+    output_txt=None,            # optional txt path for probe time series
+    probe_point=None,           # (x,y,z) or None to disable probing
+    write_every=5000,           # write field every N steps (also writes final)
+    print_every=1,              # print probe/log every N steps
+    newton_opts=None,           # dict: atol, rtol, max_it
+    krylov_opts=None,           # dict: ksp_type, pc_type, rtol, atol, max_it, reuse_pc
+    pre_step=None               # callback: pre_step(step, t) -> None (e.g., update sources)
+):
+    """
+    Run a transient nonlinear solve (Newton each time step) using prebuilt forms.
+
+    Notes
+    -----
+    - Pass in already-assembled UFL forms (Residual, Jacobian) that reference any
+      time-dependent FE Functions (e.g. laser_func). Update those in `pre_step`.
+    - The function writes:
+        * XDMF field snapshots to `output_path`
+        * optional TXT probe series to `output_txt`
+    - Returns: (time_series, probe_series) lists (empty if probe disabled).
+    """
+    import time
+    import numpy as np
+    from dolfinx import fem, io
+    from petsc4py import PETSc
+
+    dt = t_end / nsteps
+
+    # Build problem and solver once (forms refer to T_sol & updated containers).
+    problem = fem.petsc.NonlinearProblem(Residual, T_sol, bcs, J=Jacobian)
+    solver = nls.petsc.NewtonSolver(domain.comm, problem)
+
+    # Defaults (mirrors your current choices)
+    newton_defaults = dict(atol=1e-5, rtol=1e-5, max_it=50)  # fewer default iters; override if you want
+    if newton_opts:
+        newton_defaults.update(newton_opts)
+
+    # Configure Newton
+    solver.atol = newton_defaults["atol"]
+    solver.rtol = newton_defaults["rtol"]
+    solver.max_it = newton_defaults["max_it"]
+    solver.convergence_criterion = "incremental"
+
+    # Inner Krylov options
+    ksp = solver.krylov_solver
+    ksp_defaults = dict(ksp_type="gmres", pc_type="ilu", rtol=1e-6, atol=1e-8, max_it=1000, reuse_pc=True)
+    if krylov_opts:
+        ksp_defaults.update(krylov_opts)
+
+    ksp.setType(ksp_defaults["ksp_type"])
+    pc = ksp.getPC()
+    pc.setType(ksp_defaults["pc_type"])
+    if ksp_defaults["reuse_pc"]:
+        pc.setReusePreconditioner(True)
+    ksp.setTolerances(rtol=ksp_defaults["rtol"], atol=ksp_defaults["atol"], max_it=ksp_defaults["max_it"])
+
+    # Optional probe setup
+    time_series, probe_series = [], []
+    top_dof = None
+    if probe_point is not None:
+        def _probe(x, tol=1e-8):
+            return (np.abs(x[0] - probe_point[0]) < tol) & \
+                   (np.abs(x[1] - probe_point[1]) < tol) & \
+                   (np.abs(x[2] - probe_point[2]) < tol)
+        Vt = T_sol.function_space
+        top_dof = fem.locate_dofs_geometrical(Vt, _probe)
+        if len(top_dof) == 0:
+            print("Warning: No DOF found at probe point.")
+            top_dof = None
+
+    # Ensure mesh + initial field exist in XDMF; open once in append mode for the run
+    # (Assume caller already wrote mesh + T_n at t=0; if not, do it here as needed.)
+    start = time.time()
+    print("\n--- Transient nonlinear solve (Newton per step) ---")
+
+    with io.XDMFFile(domain.comm, output_path, "a") as xdmf:
+        for n in range(nsteps):
+            t = (n + 1) * dt
+
+            # User hook: update time-dependent sources, coefficients, constants, etc.
+            if pre_step is not None:
+                pre_step(n, t)
+
+            # Initial guess = last step
+            T_sol.x.array[:] = T_n.x.array
+
+            # Solve
+            its, converged = solver.solve(T_sol)
+            if not converged:
+                raise RuntimeError(f"Solver failed at t={t:.6f}s after {its} Newton iterations.")
+
+            # Advance
+            T_n.x.array[:] = T_sol.x.array
+
+            # Output field periodically (and at final step)
+            if ((n + 1) % write_every == 0) or (n == nsteps - 1):
+                xdmf.write_function(T_sol, t)
+
+            # Optional logging + probing
+            if (print_every is not None) and ((n + 1) % print_every == 0):
+                if top_dof is not None:
+                    T_top = T_sol.x.array[top_dof[0]]
+                    time_series.append(t)
+                    probe_series.append(float(T_top))
+                    print(f"Step {n+1:06d} | t={t:.6f}s | Probe: {T_top:.2f} K | Newton iters: {its}")
+                    print(f"Max T: {T_sol.x.array.max():.2f} K")
+                else:
+                    print(f"Step {n+1:06d} | t={t:.6f}s | Newton iters: {its}")
+
+    elapsed = time.time() - start
+    print(f"Done in {elapsed:.2f}s (simulated {t_end:.6f}s).")
+
+    # Optional: write probe .txt
+    if output_txt and time_series:
+        with open(output_txt, "w") as f:
+            f.write("# Time (s)\tTemperature (K)\n")
+            for tt, Tv in zip(time_series, probe_series):
+                f.write(f"{tt:.6f}\t{Tv:.2f}\n")
+
+    return time_series, probe_series
 
 
 #======================================
@@ -579,5 +712,4 @@ def setup_nondimensionalizer(material_props, laser_params, T_room):
         "redim_time": redim_time,
         "get_scales": get_scales
     }
-
 
